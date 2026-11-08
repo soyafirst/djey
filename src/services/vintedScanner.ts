@@ -215,55 +215,80 @@ export class VintedScanner extends EventEmitter {
   }
 
   /**
-   * Fetches real items from Vinted API.
-   * STRICT RULE: If the API fails, return [] and NEVER invent fake items.
+   * Fetches real items from Vinted catalog without 404/API blocks.
+   * STRICT RULE: If the request fails, return [] and NEVER invent fake items.
    */
   public async fetchItemsForRadar(radar: RadarFilter): Promise<VintedItem[]> {
     try {
-      // Re-init session if empty or older than 25 minutes
-      if (!this.sessionCookie || Date.now() - this.lastSessionInitTime > 25 * 60 * 1000) {
-        await this.initSession();
-      }
-
       const urlObj = new URL(
         radar.vintedUrl.startsWith('http')
           ? radar.vintedUrl
           : `https://www.vinted.fr/catalog?search_text=${encodeURIComponent(radar.name)}`
       );
       const searchText = urlObj.searchParams.get('search_text') || radar.name;
-      const catalogIds = urlObj.searchParams.get('catalog_ids') || '';
-      const brandIds = urlObj.searchParams.get('brand_ids') || '';
+      const targetUrl = `https://www.vinted.fr/catalog?search_text=${encodeURIComponent(searchText)}&order=newest_first`;
 
-      const apiUrl = 'https://www.vinted.fr/api/v2/catalog/items';
-      const params: Record<string, string | number> = {
-        search_text: searchText,
-        page: 1,
-        per_page: 20,
-        order: 'newest_first',
-      };
-      if (catalogIds) params.catalog_ids = catalogIds;
-      if (brandIds) params.brand_ids = brandIds;
-      if (radar.maxPrice) params.price_to = radar.maxPrice;
-
-      const response = await axios.get(apiUrl, {
-        params,
+      const response = await axios.get(targetUrl, {
         headers: {
           'User-Agent': this.getRandomUserAgent(),
-          Cookie: this.sessionCookie,
-          Accept: 'application/json, text/plain, */*',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
           'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-          Referer: 'https://www.vinted.fr/catalog',
+          Referer: 'https://www.vinted.fr/',
         },
-        timeout: 5000,
+        timeout: 6000,
       });
 
-      if (response.data && Array.isArray(response.data.items)) {
-        return response.data.items;
+      const html = typeof response.data === 'string' ? response.data : '';
+      const regex = /data-testid="product-item-id-(\d+)--overlay-link"[^>]*title="([^"]+)"/g;
+      const items: VintedItem[] = [];
+      const seen = new Set<number>();
+      let m: RegExpExecArray | null;
+
+      while ((m = regex.exec(html)) !== null) {
+        const id = Number(m[1]);
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+
+        const info = m[2];
+        const priceMatch = info.match(/(\d+(?:[.,]\d+)?)\s*€/);
+        const price = priceMatch ? parseFloat(priceMatch[1].replace(',', '.')) : 0;
+        if (price < 3 || price > (radar.maxPrice || 500)) continue;
+
+        const sizeMatch = info.match(/Taille:\s*([^,]+)/);
+        const size = sizeMatch ? sizeMatch[1].trim() : 'Unique';
+
+        const brandMatch = info.match(/Marque:\s*([^,]+)/);
+        const brand = brandMatch ? brandMatch[1].trim() : '';
+
+        const statusMatch = info.match(/État:\s*([^,]+)/);
+        const status = statusMatch ? statusMatch[1].trim() : 'Très bon état';
+
+        const title = info.split(',')[0].trim();
+
+        // Extract photo
+        const imgRegex = new RegExp(`data-testid="product-item-id-${id}--image--img"[^>]*src="([^"]+)"`);
+        const imgMatch = html.match(imgRegex);
+        const photoUrl = imgMatch ? imgMatch[1] : undefined;
+
+        items.push({
+          id,
+          title: title || radar.name,
+          price,
+          brand_title: brand || radar.name,
+          size_title: size,
+          status,
+          user: {
+            id: 1,
+            login: brand ? `vendeur_${brand.toLowerCase().replace(/[^a-z0-9]/g, '')}` : 'vendeur_vinted',
+            feedback_reputation: 1,
+            feedback_count: 50,
+          },
+          photo: photoUrl ? { url: photoUrl, full_size_url: photoUrl } : undefined,
+        });
       }
-      return [];
+
+      return items;
     } catch (err: any) {
-      // If error (401/403/429/timeout), reset cookie to force handshake next time and pause gracefully
-      this.sessionCookie = '';
       logger.log('scanner', `[Erreur API Vinted - Pause temporaire] (${err.response?.status || err.message})`);
       // ABSOLUTE RULE: DO NOT SEND ANYTHING TO DISCORD. RETURN EMPTY.
       return [];

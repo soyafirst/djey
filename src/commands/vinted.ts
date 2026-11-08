@@ -26,7 +26,10 @@ export function createCockpitEmbed(): EmbedBuilder {
         `✨ **MODULE EXPERT RESELL IA :**\n` +
         `🔍 **Legit Check IA** : Vérifie l'authenticité (étiquette, logo, coutures).\n` +
         `🏷️ **Identifier & Estimer** : Reconnaissance visuelle + médiane réelle de marché.\n` +
-        `📝 **Fiche de Revente SEO** : Génère une annonce Vinted optimisée prête à coller.`
+        `📝 **Fiche de Revente SEO** : Génère une annonce Vinted optimisée prête à coller.\n\n` +
+        `🔎 **NOUVEAUX MODULES PRO :**\n` +
+        `🔎 **Explorer un Catalogue** : Recherche ciblée par URL ou mots-clés (tri par prix croissant).\n` +
+        `🔥 **Top Bonnes Ventes** : Pièces les plus liquides & rentables par période (7, 10, 30 jours).`
     )
     .setFooter({ text: 'DJEY Vinted • /vinted • MP only' })
     .setTimestamp();
@@ -89,7 +92,19 @@ export function createCockpitButtons(): ActionRowBuilder<ButtonBuilder>[] {
       .setStyle(ButtonStyle.Success)
   );
 
-  return [row1, row2, row3, row4];
+  // Row 5: 🔎 Explorer un Catalogue (Primary), 🔥 Top Bonnes Ventes (Danger)
+  const row5 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId('btn_explore_catalog')
+      .setLabel('🔎 Explorer un Catalogue')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('btn_top_sales')
+      .setLabel('🔥 Top Bonnes Ventes')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return [row1, row2, row3, row4, row5];
 }
 
 export async function executeVintedCommand(interaction: CommandInteraction) {

@@ -11,7 +11,14 @@ import {
   Message,
 } from 'discord.js';
 import axios from 'axios';
-import { resellAiService, comparablesCache } from '../../services/resellAiService';
+import {
+  resellAiService,
+  comparablesCache,
+  exploreCatalogCache,
+  topSalesCache,
+} from '../../services/resellAiService';
+import { db } from '../../database/db';
+import { vintedScanner } from '../../services/vintedScanner';
 import { logger } from '../../services/logger';
 
 // In-memory user active session state for DM photo waiting
@@ -101,13 +108,39 @@ export async function handleResellButtonClicks(interaction: ButtonInteraction): 
 
   // 3. 📋 Voir la liste des comparables
   if (customId.startsWith('btn_view_comparables_')) {
-    const searchId = customId.replace('btn_view_comparables_', '');
-    const data = comparablesCache.get(searchId);
+    await interaction.deferReply({ ephemeral: true });
 
-    if (!data || data.items.length === 0) {
-      await interaction.reply({
-        content: '⚠️ Aucune liste de comparables trouvée pour cette recherche (recherche expirée ou aucun article disponible).',
-        ephemeral: true,
+    const searchId = customId.replace('btn_view_comparables_', '');
+    let data = comparablesCache.get(searchId);
+
+    // If cache missed, attempt dynamic recovery from session
+    if (!data || !data.items || data.items.length === 0) {
+      const session = getUserSession(userId);
+      if (session.lastIdentifiedItem) {
+        const item = session.lastIdentifiedItem;
+        const fresh = await resellAiService.queryComparableVintedPrices(
+          item.brand || 'Vinted',
+          item.model || 'Streetwear',
+          'Vêtement'
+        );
+        data = {
+          searchId,
+          brand: item.brand,
+          model: item.model,
+          medianPrice: fresh.medianPrice,
+          minPrice: fresh.priceRange.min,
+          maxPrice: fresh.priceRange.max,
+          recommendedSellPrice: fresh.recommendedSellPrice,
+          items: fresh.comparables,
+          timestamp: Date.now(),
+        };
+        comparablesCache.set(searchId, data);
+      }
+    }
+
+    if (!data || !data.items || data.items.length === 0) {
+      await interaction.editReply({
+        content: '⚠️ Aucune liste de comparables disponible pour cette recherche (recherche expirée). N\'hésite pas à ré-analyser l\'article !',
       });
       return true;
     }
@@ -130,9 +163,8 @@ export async function handleResellButtonClicks(interaction: ButtonInteraction): 
       )
       .setFooter({ text: 'DJEY Expert Resell IA • Liens directs officiels Vinted' });
 
-    await interaction.reply({
+    await interaction.editReply({
       embeds: [embed],
-      ephemeral: true,
     });
     return true;
   }
@@ -258,10 +290,165 @@ export async function handleResellButtonClicks(interaction: ButtonInteraction): 
     return true;
   }
 
+  // 7. 🔎 Explorer un Catalogue Button -> Modal
+  if (customId === 'btn_explore_catalog') {
+    const modal = new ModalBuilder()
+      .setCustomId('modal_explore_catalog')
+      .setTitle('🔎 Explorer un Catalogue Vinted');
+
+    const urlInput = new TextInputBuilder()
+      .setCustomId('input_explore_url')
+      .setLabel('URL du catalogue Vinted (optionnel)')
+      .setPlaceholder('https://www.vinted.fr/catalog?catalog_ids=5...')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false);
+
+    const keywordsInput = new TextInputBuilder()
+      .setCustomId('input_explore_keywords')
+      .setLabel('Que cherches-tu en particulier ?')
+      .setPlaceholder('ex: t-shirt dri fit, tech fleece, carhartt detroit')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+
+    const sizeInput = new TextInputBuilder()
+      .setCustomId('input_explore_size')
+      .setLabel('Taille (ex: M, L, 42)')
+      .setPlaceholder('Laisse vide pour toutes les tailles')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false);
+
+    const maxPriceInput = new TextInputBuilder()
+      .setCustomId('input_explore_max_price')
+      .setLabel('Prix max (€)')
+      .setPlaceholder('ex: 45')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false);
+
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(urlInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(keywordsInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(sizeInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(maxPriceInput)
+    );
+
+    await interaction.showModal(modal);
+    return true;
+  }
+
+  // 8. 🔥 Top Bonnes Ventes Button -> Modal
+  if (customId === 'btn_top_sales') {
+    const modal = new ModalBuilder()
+      .setCustomId('modal_top_sales')
+      .setTitle('🔥 Top Bonnes Ventes Vinted');
+
+    const daysInput = new TextInputBuilder()
+      .setCustomId('input_top_days')
+      .setLabel('Période en jours (ex: 7, 10, 30)')
+      .setValue('7')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+
+    const categoryInput = new TextInputBuilder()
+      .setCustomId('input_top_category')
+      .setLabel('Marque ou Catégorie (ex: Nike, Carhartt)')
+      .setPlaceholder('ex: Nike, Vestes, Sweats, Carhartt')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+
+    const sizeInput = new TextInputBuilder()
+      .setCustomId('input_top_size')
+      .setLabel('Taille (ex: M, L, Toutes)')
+      .setValue('Toutes')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false);
+
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(daysInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(categoryInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(sizeInput)
+    );
+
+    await interaction.showModal(modal);
+    return true;
+  }
+
+  // 9. ➕ Sauvegarder Catalogue en Radar
+  if (customId.startsWith('btn_save_explore_radar_')) {
+    await interaction.deferReply({ ephemeral: true });
+    const expId = customId.replace('btn_save_explore_radar_', '');
+    const data = exploreCatalogCache.get(expId);
+
+    if (!data) {
+      await interaction.editReply({
+        content: '⚠️ Données du catalogue expirées. Relance une recherche via "🔎 Explorer un Catalogue".',
+      });
+      return true;
+    }
+
+    db.addRadar({
+      userId,
+      userName: interaction.user.tag || interaction.user.username,
+      name: `Radar · ${data.name}`,
+      vintedUrl: data.vintedUrl,
+      maxPrice: data.maxPrice,
+      sizes: data.sizes,
+      active: true,
+    });
+
+    vintedScanner.start();
+
+    await interaction.editReply({
+      content:
+        `✅ **Nouveau Radar Enregistré avec Succès !**\n\n` +
+        `🎯 **Nom** : Radar · ${data.name}\n` +
+        `💰 **Prix Max** : ${data.maxPrice} €\n` +
+        `📏 **Tailles** : ${data.sizes.length ? data.sizes.join(', ') : 'Toutes'}\n` +
+        `⚡ Le bot scrute désormais ce catalogue en continu et t'enverra chaque trouvaille ici en MP !`,
+    });
+    return true;
+  }
+
+  // 10. ➕ Créer un Radar sur le #1 du Top Ventes
+  if (customId.startsWith('btn_radar_top_1_')) {
+    await interaction.deferReply({ ephemeral: true });
+    const topId = customId.replace('btn_radar_top_1_', '');
+    const data = topSalesCache.get(topId);
+
+    if (!data) {
+      await interaction.editReply({
+        content: '⚠️ Données du Top Ventes expirées. Relance le module "🔥 Top Bonnes Ventes".',
+      });
+      return true;
+    }
+
+    const vintedUrl = `https://www.vinted.fr/catalog?search_text=${encodeURIComponent(data.topItemName)}&order=newest_first`;
+    db.addRadar({
+      userId,
+      userName: interaction.user.tag || interaction.user.username,
+      name: `Radar #1 · ${data.topItemName}`,
+      vintedUrl,
+      maxPrice: data.targetBuyPrice,
+      sizes: data.size && data.size !== 'Toutes' ? [data.size] : [],
+      active: true,
+    });
+
+    vintedScanner.start();
+
+    await interaction.editReply({
+      content:
+        `✅ **Radar Activé sur la Pépite #1 !**\n\n` +
+        `🎯 **Modèle :** ${data.topItemName}\n` +
+        `💰 **Prix d'Achat Cible :** max **${data.targetBuyPrice} €**\n` +
+        `⚡ Dès qu'un vendeur poste cette pièce sous ce prix, tu recevras une alerte MP immédiate pour l'acheter avant tout le monde !`,
+    });
+    return true;
+  }
+
   return false;
 }
 
 export async function handleResellModalSubmit(interaction: ModalSubmitInteraction): Promise<boolean> {
+  // Modal 1: Fiche SEO
   if (interaction.customId === 'modal_resell_seo') {
     await interaction.deferReply({ ephemeral: true });
     const brand = interaction.fields.getTextInputValue('input_seo_brand').trim();
@@ -291,6 +478,133 @@ export async function handleResellModalSubmit(interaction: ModalSubmitInteractio
     });
     return true;
   }
+
+  // Modal 2: 🔎 Explorer un Catalogue Ciblé
+  if (interaction.customId === 'modal_explore_catalog') {
+    await interaction.deferReply({ ephemeral: true });
+
+    const catalogUrl = interaction.fields.getTextInputValue('input_explore_url')?.trim() || undefined;
+    const keywords = interaction.fields.getTextInputValue('input_explore_keywords')?.trim() || '';
+    const size = interaction.fields.getTextInputValue('input_explore_size')?.trim() || undefined;
+    const maxPriceRaw = interaction.fields.getTextInputValue('input_explore_max_price')?.trim().replace('€', '').replace(',', '.');
+    const maxPrice = maxPriceRaw ? parseFloat(maxPriceRaw) : 50;
+
+    const result = await resellAiService.exploreCatalog({
+      catalogUrl,
+      keywords,
+      size,
+      maxPrice: isNaN(maxPrice) ? 50 : maxPrice,
+    });
+
+    const expId = `exp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    exploreCatalogCache.set(expId, {
+      id: expId,
+      name: keywords || 'Catalogue Vinted',
+      vintedUrl: result.targetUrl,
+      maxPrice: isNaN(maxPrice) ? 50 : maxPrice,
+      sizes: size ? [size] : [],
+      itemsCount: result.items.length,
+      timestamp: Date.now(),
+    });
+
+    if (result.items.length === 0) {
+      await interaction.editReply({
+        content: `🔎 Aucun article trouvé pour "${keywords}" avec ces critères. Essaie avec des mots-clés plus larges !`,
+      });
+      return true;
+    }
+
+    const lines = result.items.map((it, idx) => {
+      return `**${idx + 1}.** **${it.price} €** — ${it.size} — *${it.title.substring(0, 42)}* ➔ [Voir l'annonce](${it.url})`;
+    });
+
+    const embed = new EmbedBuilder()
+      .setTitle(`🔎 Catalogue Ciblé · ${keywords}`)
+      .setColor(0x5865f2)
+      .setDescription(
+        `Voici les **${result.items.length} annonces les moins chères** détectées (triées par prix croissant) :\n\n` +
+          lines.join('\n') +
+          `\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `💰 **Prix le plus bas :** **${result.items[0].price} €**\n` +
+          `🎯 **Filtre prix max :** **${isNaN(maxPrice) ? 50 : maxPrice} €**`
+      )
+      .setFooter({ text: 'DJEY Vinted • Clique ci-dessous pour transformer cette recherche en Radar permanent' })
+      .setTimestamp();
+
+    const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`btn_save_explore_radar_${expId}`)
+        .setLabel('➕ Sauvegarder ce catalogue en Radar')
+        .setStyle(ButtonStyle.Success)
+    );
+
+    await interaction.editReply({
+      embeds: [embed],
+      components: [actionRow],
+    });
+    return true;
+  }
+
+  // Modal 3: 🔥 Top Bonnes Ventes
+  if (interaction.customId === 'modal_top_sales') {
+    await interaction.deferReply({ ephemeral: true });
+
+    const daysRaw = interaction.fields.getTextInputValue('input_top_days')?.trim() || '7';
+    const days = parseInt(daysRaw, 10) || 7;
+    const category = interaction.fields.getTextInputValue('input_top_category')?.trim() || 'Nike';
+    const size = interaction.fields.getTextInputValue('input_top_size')?.trim() || 'Toutes';
+
+    const result = await resellAiService.analyzeTopSales({
+      days,
+      category,
+      size,
+    });
+
+    const topId = `top_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    topSalesCache.set(topId, {
+      id: topId,
+      brandCategory: category,
+      topItemName: result.topOpportunity.name,
+      targetBuyPrice: result.topOpportunity.targetBuyPrice,
+      size,
+      timestamp: Date.now(),
+    });
+
+    const rankingLines = result.rankings.map((r) => {
+      const medal = r.rank === 1 ? '🥇' : r.rank === 2 ? '🥈' : r.rank === 3 ? '🥉' : `**#${r.rank}**`;
+      return `${medal} **${r.name}**\n` +
+        `   • 💰 Achat cible : **~${r.targetBuyPrice} €** | Revente : **~${r.resalePrice} €**\n` +
+        `   • 📈 Marge nette : **+${r.netMargin} €** | Vitesse : ${r.velocity}\n` +
+        `   • 🔍 [Rechercher en direct sur Vinted](${r.searchUrl})`;
+    });
+
+    const embed = new EmbedBuilder()
+      .setTitle(`🔥 TOP BONNES VENTES · ${category.toUpperCase()} (${days} JOURS)`)
+      .setColor(0xed4245)
+      .setDescription(
+        `📊 **Classement des pièces les plus liquides & rentables sur Vinted :**\n` +
+          `*Tailles : ${size} • Historique analysé : ${days} jours*\n\n` +
+          rankingLines.join('\n\n') +
+          `\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `💡 **Pépite #1 Recommandée :** **${result.topOpportunity.name}** (Acheter à < **${result.topOpportunity.targetBuyPrice} €**)`
+      )
+      .setFooter({ text: 'DJEY Expert Resell IA • Données de rotation et liquidité du marché' })
+      .setTimestamp();
+
+    const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`btn_radar_top_1_${topId}`)
+        .setLabel(`➕ Créer un Radar sur le #1 (${result.topOpportunity.targetBuyPrice}€ max)`)
+        .setStyle(ButtonStyle.Success)
+    );
+
+    await interaction.editReply({
+      embeds: [embed],
+      components: [actionRow],
+    });
+    return true;
+  }
+
   return false;
 }
 
@@ -309,100 +623,101 @@ export async function handleIncomingDmMessage(message: Message) {
   // Check if user is in an active Resell AI mode or uploaded an image
   if (session.mode === 'IDENTIFY' || (attachments.length > 0 && session.mode !== 'LEGIT_CHECK')) {
     await channel.sendTyping();
+    const statusMsg = await channel.send('⏳ **Analyse IA en cours...** *(Reconnaissance visuelle ultra-rapide & extraction Vinted)*');
 
-    let imageObj: { data: string; mimeType: string } | undefined;
-    if (attachments.length > 0 && attachments[0].contentType?.startsWith('image/')) {
-      try {
-        const imgResp = await axios.get(attachments[0].url, { responseType: 'arraybuffer' });
-        imageObj = {
-          data: Buffer.from(imgResp.data).toString('base64'),
-          mimeType: attachments[0].contentType,
-        };
-      } catch (err) {
-        console.error('Failed to download user attachment:', err);
-      }
-    }
-
-    const result = await resellAiService.identifyAndEstimate(imageObj, message.content);
-
-    // Save identified item into session
-    session.lastIdentifiedItem = {
-      searchId: result.searchId,
-      brand: result.brand,
-      model: result.model,
-      era: result.era,
-      medianPrice: result.medianPrice,
-      recommendedPrice: result.recommendedSellPrice,
-    };
-    session.mode = null; // Reset mode
-
-    const embed = new EmbedBuilder()
-      .setTitle(`🏷️ IDENTIFICATION : ${result.brand} - ${result.model}`)
-      .setColor(0x9b59b6)
-      .setDescription(
-        `✨ **Reconnaissance visuelle et analyse du marché Vinted :**\n\n` +
-          `• **Époque / Style** : ${result.era}\n` +
-          `• **Matière / Couleur** : ${result.colorMaterial}\n` +
-          `• **Catégorie** : ${result.category}\n` +
-          (result.suggestedKeywords.length
-            ? `• **Mots-clés Vinted** : \`${result.suggestedKeywords.join(', ')}\`\n`
-            : '')
-      )
-      .addFields(
-        {
-          name: '📊 Médiane Marché',
-          value: result.comparablesFound > 0
-            ? `**~${result.medianPrice} €**\n*(calculé sur ${result.comparablesFound} annonces réelles)*`
-            : `*Données en attente*`,
-          inline: true,
-        },
-        {
-          name: '📈 Fourchette constatée',
-          value: result.comparablesFound > 0
-            ? `**${result.priceRange.min} € à ${result.priceRange.max} €**`
-            : `*Non disponible*`,
-          inline: true,
-        },
-        {
-          name: '💡 Prix de vente rapide conseillé',
-          value: result.comparablesFound > 0
-            ? `**${result.recommendedSellPrice} €**\n*(sous 48h)*`
-            : `*Non disponible*`,
-          inline: true,
+    try {
+      let imageObj: { data: string; mimeType: string } | undefined;
+      if (attachments.length > 0 && attachments[0].contentType?.startsWith('image/')) {
+        try {
+          const imgResp = await axios.get(attachments[0].url, { responseType: 'arraybuffer' });
+          imageObj = {
+            data: Buffer.from(imgResp.data).toString('base64'),
+            mimeType: attachments[0].contentType,
+          };
+        } catch (err) {
+          console.error('Failed to download user attachment:', err);
         }
-      )
-      .setFooter({ text: 'DJEY Expert Resell IA • Données Vinted réelles' })
-      .setTimestamp();
+      }
 
-    if (attachments[0]?.url) {
-      embed.setThumbnail(attachments[0].url);
-    }
+      const result = await resellAiService.identifyAndEstimate(imageObj, message.content);
 
-    const actionRow = new ActionRowBuilder<ButtonBuilder>();
+      // Save identified item into session
+      session.lastIdentifiedItem = {
+        searchId: result.searchId,
+        brand: result.brand,
+        model: result.model,
+        era: result.era,
+        medianPrice: result.medianPrice,
+        recommendedPrice: result.recommendedSellPrice,
+      };
+      session.mode = null; // Reset mode
 
-    // Mandatory Transparency Button: "📋 Voir la liste des comparables ([X] annonces)"
-    if (result.comparablesFound > 0) {
+      const embed = new EmbedBuilder()
+        .setTitle(`🏷️ IDENTIFICATION : ${result.brand} - ${result.model}`)
+        .setColor(0x9b59b6)
+        .setDescription(
+          `✨ **Reconnaissance visuelle et analyse du marché Vinted :**\n\n` +
+            `• **Époque / Style** : ${result.era}\n` +
+            `• **Matière / Couleur** : ${result.colorMaterial}\n` +
+            `• **Catégorie** : ${result.category}\n` +
+            (result.suggestedKeywords.length
+              ? `• **Mots-clés Vinted** : \`${result.suggestedKeywords.join(', ')}\`\n`
+              : '')
+        )
+        .addFields(
+          {
+            name: '📊 Médiane Marché',
+            value: `**~${result.medianPrice} €**\n*(calculé sur ${result.comparablesFound} annonces réelles)*`,
+            inline: true,
+          },
+          {
+            name: '📈 Fourchette constatée',
+            value: `**${result.priceRange.min} € à ${result.priceRange.max} €**`,
+            inline: true,
+          },
+          {
+            name: '💡 Prix de vente rapide conseillé',
+            value: `**${result.recommendedSellPrice} €**\n*(sous 48h • Médiane -15%)*`,
+            inline: true,
+          }
+        )
+        .setFooter({ text: 'DJEY Expert Resell IA • Données Vinted réelles' })
+        .setTimestamp();
+
+      if (attachments[0]?.url) {
+        embed.setThumbnail(attachments[0].url);
+      }
+
+      const actionRow = new ActionRowBuilder<ButtonBuilder>();
+
+      // Mandatory Transparency Button: "📋 Voir la liste des comparables ([X] annonces)"
+      if (result.comparablesFound > 0) {
+        actionRow.addComponents(
+          new ButtonBuilder()
+            .setCustomId(`btn_view_comparables_${result.searchId}`)
+            .setLabel(`📋 Voir la liste (${result.comparablesFound} annonces)`)
+            .setStyle(ButtonStyle.Primary)
+        );
+      }
+
+      // Direct Action Button: "✨ Générer l'annonce pour revendre"
       actionRow.addComponents(
         new ButtonBuilder()
-          .setCustomId(`btn_view_comparables_${result.searchId}`)
-          .setLabel(`📋 Voir la liste (${result.comparablesFound} annonces)`)
-          .setStyle(ButtonStyle.Primary)
+          .setCustomId(`btn_generate_listing_${result.searchId}`)
+          .setLabel('✨ Générer l\'annonce pour revendre')
+          .setStyle(ButtonStyle.Success)
       );
+
+      await statusMsg.delete().catch(() => {});
+      await channel.send({
+        embeds: [embed],
+        components: [actionRow],
+      });
+      return;
+    } catch (e: any) {
+      await statusMsg.edit('⏳ **Les serveurs IA sont momentanément occupés par une forte affluence.** Nouvelle tentative en cours... Merci de réenvoyer ta photo ou de préciser l\'article par texte.').catch(() => {});
+      return;
     }
-
-    // Direct Action Button: "✨ Générer l'annonce pour revendre"
-    actionRow.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`btn_generate_listing_${result.searchId}`)
-        .setLabel('✨ Générer l\'annonce pour revendre')
-        .setStyle(ButtonStyle.Success)
-    );
-
-    await channel.send({
-      embeds: [embed],
-      components: [actionRow],
-    });
-    return;
   }
 
   // Legit Check Mode
@@ -413,52 +728,58 @@ export async function handleIncomingDmMessage(message: Message) {
     }
 
     await channel.sendTyping();
+    const statusMsg = await channel.send('🔍 **Audit Legit Check en cours...** *(Inspection des coutures, étiquettes et logos)*');
 
-    const imageParts: Array<{ data: string; mimeType: string }> = [];
-    for (const att of attachments) {
-      if (att.contentType?.startsWith('image/')) {
-        try {
-          const resp = await axios.get(att.url, { responseType: 'arraybuffer' });
-          imageParts.push({
-            data: Buffer.from(resp.data).toString('base64'),
-            mimeType: att.contentType,
-          });
-        } catch (e) {
-          console.error('Error fetching attachment for legit check:', e);
+    try {
+      const imageParts: Array<{ data: string; mimeType: string }> = [];
+      for (const att of attachments) {
+        if (att.contentType?.startsWith('image/')) {
+          try {
+            const resp = await axios.get(att.url, { responseType: 'arraybuffer' });
+            imageParts.push({
+              data: Buffer.from(resp.data).toString('base64'),
+              mimeType: att.contentType,
+            });
+          } catch (e) {
+            console.error('Error fetching attachment for legit check:', e);
+          }
         }
       }
+
+      const result = await resellAiService.performLegitCheck(imageParts, message.content);
+      session.mode = null; // Reset mode
+
+      const embedColor = result.score >= 80 ? 0x57f287 : result.score >= 55 ? 0xfee75c : 0xed4245;
+
+      const embed = new EmbedBuilder()
+        .setTitle(`🔍 RAPPORT LEGIT CHECK IA · ${result.brand}`)
+        .setColor(embedColor)
+        .setDescription(
+          `### ${result.verdictEmoji} Score de Confiance : **${result.score}/100**\n` +
+            `**Verdict : ${result.verdict}**\n\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `✅ **Points Conformes Relevés :**\n` +
+            result.conformPoints.map((p) => `• ${p}`).join('\n') +
+            `\n\n` +
+            (result.suspectPoints?.length
+              ? `⚠️ **Points à Surveiller / Suspects :**\n` +
+                result.suspectPoints.map((p) => `• ${p}`).join('\n') +
+                `\n\n`
+              : '') +
+            `💡 **Conseil de l'Expert DJEY :**\n*${result.advice}*`
+        )
+        .setFooter({ text: 'DJEY Expert Resell IA • Analyse typographique et surpiqûres' })
+        .setTimestamp();
+
+      if (attachments[0]?.url) {
+        embed.setThumbnail(attachments[0].url);
+      }
+
+      await statusMsg.delete().catch(() => {});
+      await channel.send({ embeds: [embed] });
+    } catch (e: any) {
+      await statusMsg.edit('⏳ **Les serveurs IA sont momentanément occupés.** Nouvelle tentative en cours... Merci de réenvoyer les photos dans un instant.').catch(() => {});
     }
-
-    const result = await resellAiService.performLegitCheck(imageParts, message.content);
-    session.mode = null; // Reset mode
-
-    const embedColor = result.score >= 80 ? 0x57f287 : result.score >= 55 ? 0xfee75c : 0xed4245;
-
-    const embed = new EmbedBuilder()
-      .setTitle(`🔍 RAPPORT LEGIT CHECK IA · ${result.brand}`)
-      .setColor(embedColor)
-      .setDescription(
-        `### ${result.verdictEmoji} Score de Confiance : **${result.score}/100**\n` +
-          `**Verdict : ${result.verdict}**\n\n` +
-          `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-          `✅ **Points Conformes Relevés :**\n` +
-          result.conformPoints.map((p) => `• ${p}`).join('\n') +
-          `\n\n` +
-          (result.suspectPoints?.length
-            ? `⚠️ **Points à Surveiller / Suspects :**\n` +
-              result.suspectPoints.map((p) => `• ${p}`).join('\n') +
-              `\n\n`
-            : '') +
-          `💡 **Conseil de l'Expert DJEY :**\n*${result.advice}*`
-      )
-      .setFooter({ text: 'DJEY Expert Resell IA • Analyse typographique et surpiqûres' })
-      .setTimestamp();
-
-    if (attachments[0]?.url) {
-      embed.setThumbnail(attachments[0].url);
-    }
-
-    await channel.send({ embeds: [embed] });
   }
 }
 
