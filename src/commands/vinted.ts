@@ -22,7 +22,11 @@ export function createCockpitEmbed(): EmbedBuilder {
         `⚙️ **Contrôle** : Pause • stop • wipe depuis "Mes filtres".\n` +
         `🏷️ **Vente** : Suis une annonce jusqu'à sa vente réelle.\n` +
         `🛒 **Autobuy** : Fais défiler les annonces et achète en direct.\n` +
-        `🎯 **Autocop** : Catalogue + prix/taille ➔ ciblage automatique dès qu'une pépite sort.`
+        `🎯 **Autocop** : Catalogue + prix/taille ➔ ciblage automatique dès qu'une pépite sort.\n\n` +
+        `✨ **MODULE EXPERT RESELL IA :**\n` +
+        `🔍 **Legit Check IA** : Vérifie l'authenticité (étiquette, logo, coutures).\n` +
+        `🏷️ **Identifier & Estimer** : Reconnaissance visuelle + médiane réelle de marché.\n` +
+        `📝 **Fiche de Revente SEO** : Génère une annonce Vinted optimisée prête à coller.`
     )
     .setFooter({ text: 'DJEY Vinted • /vinted • MP only' })
     .setTimestamp();
@@ -69,7 +73,23 @@ export function createCockpitButtons(): ActionRowBuilder<ButtonBuilder>[] {
       .setStyle(ButtonStyle.Success)
   );
 
-  return [row1, row2, row3];
+  // Row 4: 🔍 Legit Check IA (Primary), 🏷️ Identifier & Estimer (Primary), 📝 Fiche de Revente SEO (Success)
+  const row4 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId('btn_legit_check')
+      .setLabel('🔍 Legit Check IA')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('btn_identify_estimate')
+      .setLabel('🏷️ Identifier & Estimer')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('btn_resell_seo')
+      .setLabel('📝 Fiche de Revente SEO')
+      .setStyle(ButtonStyle.Success)
+  );
+
+  return [row1, row2, row3, row4];
 }
 
 export async function executeVintedCommand(interaction: CommandInteraction) {

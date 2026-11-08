@@ -10,9 +10,17 @@ import { createNewRadarModal, createTrackItemModal } from '../modals/radarModal'
 import { createStopFilterSelectMenu } from '../selectMenus/filterSelect';
 import { marketAnalyzer } from '../../services/marketAnalyzer';
 
+import { handleResellButtonClicks } from './resellAiHandlers';
+
 export async function handleButtonClick(interaction: ButtonInteraction) {
   const customId = interaction.customId;
   const userId = interaction.user.id;
+
+  // Check Resell AI buttons first (Legit Check, Identify, SEO Listing)
+  const handledByResellAi = await handleResellButtonClicks(interaction);
+  if (handledByResellAi) {
+    return;
+  }
 
   // 1. ➕ Nouveau Radar
   if (customId === 'btn_new_radar') {

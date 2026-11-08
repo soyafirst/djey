@@ -20,6 +20,10 @@ export async function executeHelpCommand(interaction: CommandInteraction) {
         `• **👁️ Suivre une annonce** : Surveille l'évolution de prix d'un article spécifique jusqu'à sa vente.\n` +
         `• **🛒 Autobuy** : Accès rapide aux opportunités immédiates.\n` +
         `• **✅ Autocop** : Ciblage automatique ultra rapide.\n\n` +
+        `### 🧠 Module Expert Resell IA (Nouveau) :\n` +
+        `• **🔍 Legit Check IA** : Envoie une photo d'étiquette, logo ou coutures pour un audit d'authenticité noté sur 100 avec points suspects et conformes.\n` +
+        `• **🏷️ Identifier & Estimer** : Reconnaissance visuelle par IA (marque, modèle exact, époque) + calcul de la médiane réelle et liquidité sur le marché Vinted.\n` +
+        `• **📝 Fiche de Revente SEO** : Génération d'une annonce Vinted complète optimisée avec mots-clés chauds, arguments de vente et prix conseillé, copiable en 1 clic.\n\n` +
         `### ⚡ Alertes Pépites en DM :\n` +
         `Chaque alerte te donne le prix du vendeur, la **médiane réelle de marché**, et le **bénéfice net estimé** après frais. Trois boutons te permettent d'acheter directement, de copier un texte de négo à -25%, ou d'ignorer l'article.`
     )

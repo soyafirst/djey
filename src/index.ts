@@ -18,6 +18,10 @@ import { handleRadarModalSubmit } from './interactions/modals/radarModal';
 import { handleFilterSelectMenu } from './interactions/selectMenus/filterSelect';
 import { createVintedAlertEmbed, createVintedAlertButtons } from './services/alertFormatter';
 import { logger } from './services/logger';
+import {
+  handleResellModalSubmit,
+  handleIncomingDmMessage,
+} from './interactions/buttons/resellAiHandlers';
 
 export const client = new Client({
   intents: [
@@ -124,7 +128,10 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     // 3. Modals
     if (interaction.isModalSubmit()) {
       logger.log('info', `Formulaire modal validé [${interaction.customId}] par @${interaction.user.tag}`);
-      await handleRadarModalSubmit(interaction);
+      const handled = await handleResellModalSubmit(interaction);
+      if (!handled) {
+        await handleRadarModalSubmit(interaction);
+      }
       return;
     }
 
@@ -144,6 +151,15 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
       }
     }
+  }
+});
+
+// Event: Message Create (Processes incoming DM images and text for Resell AI & Legit Check)
+client.on(Events.MessageCreate, async (message) => {
+  try {
+    await handleIncomingDmMessage(message);
+  } catch (err: any) {
+    logger.log('error', `Erreur traitement message DM: ${err.message}`);
   }
 });
 

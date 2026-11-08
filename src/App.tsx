@@ -341,6 +341,13 @@ export default function App() {
                   </span>
                   Tape <code className="text-[#00A8FC] font-bold">/vinted</code> dans tes messages privés avec le bot pour afficher le Cockpit persistant avec tous les boutons interactifs.
                 </div>
+
+                <div className="bg-[#111214] p-3 rounded-xl border border-purple-500/30 bg-purple-500/5">
+                  <span className="font-semibold text-purple-300 block mb-1">
+                    ✨ 3. Module Expert Resell IA
+                  </span>
+                  Retrouve directement en DM les boutons <strong>[🔍 Legit Check IA]</strong>, <strong>[🏷️ Identifier &amp; Estimer]</strong> et <strong>[📝 Fiche de Revente SEO]</strong> pour analyser tes photos d'articles et calculer la médiane réelle.
+                </div>
               </div>
             </div>
 
