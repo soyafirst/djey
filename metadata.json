@@ -1,0 +1,6 @@
+{
+  "name": "DJEY Vinted - Discord Bot & Cockpit",
+  "description": "Cockpit interactif Discord v14 pour bot Vinted autonome en Messages Privés : radar temps-réel, analyseur de marge et alertes pépites.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
