@@ -76,7 +76,7 @@ export async function registerSlashCommands(token: string, clientId: string) {
 }
 
 // Event: Ready
-client.once(Events.ClientReady, (readyClient) => {
+client.once(Events.ClientReady, async (readyClient) => {
   isBotConnected = true;
   botError = null;
   lastHeartbeat = new Date().toISOString();
@@ -94,6 +94,10 @@ client.once(Events.ClientReady, (readyClient) => {
 
   logger.log('success', `Bot DJEY connecté avec succès sur Discord ! (Tag: ${readyClient.user.tag})`);
   logger.log('info', `Statut Discord activé: "Regarde DJEY Vinted • /vinted"`);
+
+  // Auto-register slash commands using the verified bot application ID
+  const effectiveAppId = readyClient.user.id;
+  await registerSlashCommands(config.token, effectiveAppId);
 
   // Start background Vinted scanner
   vintedScanner.start();

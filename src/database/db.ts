@@ -69,6 +69,9 @@ class LocalDatabase {
     },
   };
 
+  // In-memory Set for O(1) instantaneous item deduplication
+  private seenItems = new Set<string>();
+
   constructor() {
     this.init();
   }
@@ -88,82 +91,16 @@ class LocalDatabase {
           ...parsed,
           stats: { ...this.data.stats, ...(parsed.stats || {}) },
         };
+        // Populate in-memory Set from persisted seen IDs
+        if (Array.isArray(this.data.seenItemIds)) {
+          this.seenItems = new Set(this.data.seenItemIds.map(String));
+        }
       } else {
-        // Seed initial sample radar for immediate user experience
-        this.seedInitialData();
         this.save();
       }
     } catch (err) {
-      console.warn('Could not read DB file, starting with memory store:', err);
-      this.seedInitialData();
+      console.warn('DB initialization notice:', err);
     }
-  }
-
-  private seedInitialData() {
-    this.data.radars = [
-      {
-        id: 'radar_sample_1',
-        userId: 'default_user',
-        userName: 'DJEY Demo User',
-        name: 'Doudounes Ralph Lauren',
-        vintedUrl: 'https://www.vinted.fr/catalog?search_text=doudoune+ralph+lauren&price_to=60',
-        maxPrice: 60,
-        sizes: ['M', 'L'],
-        active: true,
-        createdAt: new Date().toISOString(),
-        itemsFound: 3,
-        lastScannedAt: new Date().toISOString(),
-      },
-      {
-        id: 'radar_sample_2',
-        userId: 'default_user',
-        userName: 'DJEY Demo User',
-        name: 'Sneakers Nike Dunk Low',
-        vintedUrl: 'https://www.vinted.fr/catalog?search_text=nike+dunk+low&price_to=85',
-        maxPrice: 85,
-        sizes: ['42', '43', '44'],
-        active: true,
-        createdAt: new Date().toISOString(),
-        itemsFound: 5,
-        lastScannedAt: new Date().toISOString(),
-      },
-    ];
-
-    this.data.alerts = [
-      {
-        id: 'v_alert_101',
-        radarId: 'radar_sample_1',
-        userId: 'default_user',
-        title: 'Doudoune sans manche Polo Ralph Lauren Noire',
-        brand: 'Ralph Lauren',
-        size: 'L',
-        price: 38,
-        medianPrice: 75,
-        estimatedMargin: 32.5,
-        condition: 'Très bon état',
-        url: 'https://www.vinted.fr/items/492019482-doudoune-ralph-lauren',
-        photo: 'https://images.unsplash.com/photo-1544923246-77307dd654cb?w=600&auto=format&fit=crop&q=80',
-        timestamp: new Date(Date.now() - 1000 * 60 * 12).toISOString(),
-      },
-      {
-        id: 'v_alert_102',
-        radarId: 'radar_sample_2',
-        userId: 'default_user',
-        title: 'Nike Dunk Low Retro Panda Original',
-        brand: 'Nike',
-        size: '43',
-        price: 55,
-        medianPrice: 110,
-        estimatedMargin: 48,
-        condition: 'Neuf avec étiquette',
-        url: 'https://www.vinted.fr/items/492019999-nike-dunk-low-panda',
-        photo: 'https://images.unsplash.com/photo-1595950653106-6c9ebd614d3a?w=600&auto=format&fit=crop&q=80',
-        timestamp: new Date(Date.now() - 1000 * 60 * 4).toISOString(),
-      },
-    ];
-    this.data.seenItemIds = ['492019482', '492019999'];
-    this.data.stats.totalAlerts = 2;
-    this.data.stats.totalScans = 142;
   }
 
   private save() {
@@ -172,6 +109,7 @@ class LocalDatabase {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
+      this.data.seenItemIds = Array.from(this.seenItems);
       fs.writeFileSync(DB_PATH, JSON.stringify(this.data, null, 2), 'utf-8');
     } catch (err) {
       console.error('Failed to persist database:', err);
@@ -245,18 +183,19 @@ class LocalDatabase {
     return count;
   }
 
-  // Deduplication
-  public isItemSeen(itemId: string): boolean {
-    return this.data.seenItemIds.includes(String(itemId));
+  // Deduplication using Set
+  public isItemSeen(itemId: string | number): boolean {
+    return this.seenItems.has(String(itemId));
   }
 
-  public markItemSeen(itemId: string) {
+  public markItemSeen(itemId: string | number) {
     const sId = String(itemId);
-    if (!this.data.seenItemIds.includes(sId)) {
-      this.data.seenItemIds.push(sId);
-      // Cap seen items at 5,000 to prevent unbounded memory growth
-      if (this.data.seenItemIds.length > 5000) {
-        this.data.seenItemIds.splice(0, 500);
+    if (!this.seenItems.has(sId)) {
+      this.seenItems.add(sId);
+      // Cap memory at 10,000 items
+      if (this.seenItems.size > 10000) {
+        const first = this.seenItems.values().next().value;
+        if (first) this.seenItems.delete(first);
       }
       this.save();
     }
@@ -322,7 +261,7 @@ class LocalDatabase {
       ...this.data.stats,
       activeRadars: this.data.radars.filter((r) => r.active).length,
       totalRadars: this.data.radars.length,
-      totalSeenItems: this.data.seenItemIds.length,
+      totalSeenItems: this.seenItems.size,
     };
   }
 }

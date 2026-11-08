@@ -11,13 +11,14 @@ import {
   Message,
 } from 'discord.js';
 import axios from 'axios';
-import { resellAiService } from '../../services/resellAiService';
+import { resellAiService, comparablesCache } from '../../services/resellAiService';
 import { logger } from '../../services/logger';
 
 // In-memory user active session state for DM photo waiting
 export interface UserResellSession {
   mode: 'IDENTIFY' | 'LEGIT_CHECK' | 'SEO_LISTING' | null;
   lastIdentifiedItem?: {
+    searchId: string;
     brand: string;
     model: string;
     era?: string;
@@ -59,7 +60,7 @@ export async function handleResellButtonClicks(interaction: ButtonInteraction): 
       .setColor(0x5865f2)
       .setDescription(
         `📸 **Envoie les photos de ta pièce directement dans ce message privé :**\n\n` +
-          `Pour un diagnostic précis à 100%, envoie au choix :\n` +
+          `Pour un diagnostic précis, envoie au choix :\n` +
           `• 🏷️ **Photo de l'étiquette col / taille** (police, typographie, espacements)\n` +
           `• 🧵 **Photo du logo brodé ou imprimé** (qualité des surpiqûres et proportions)\n` +
           `• 🧼 **Photo de l'étiquette intérieure de lavage / composition**\n\n` +
@@ -82,11 +83,12 @@ export async function handleResellButtonClicks(interaction: ButtonInteraction): 
       .setTitle('🏷️ IDENTIFICATION VISUELLE & ESTIMATION RÉELLE')
       .setColor(0x9b59b6)
       .setDescription(
-        `📸 **Envoie la photo de l'article à analyser en DM** (ou écris simplement son nom/marque/modèle).\n\n` +
+        `📸 **Envoie la photo de l'article à analyser en DM** (ou écris son nom/marque/modèle).\n\n` +
           `L'intelligence artificielle va :\n` +
-          `1. Identifier la **Marque**, le **Modèle exact** et l'**Époque** (ex: Vintage 90s, Y2K).\n` +
+          `1. Identifier la **Marque**, le **Modèle exact** et l'**Époque** (Vintage 90s, Y2K).\n` +
           `2. Interroger en direct l'API Vinted pour récupérer les annonces comparables similaires.\n` +
-          `3. Calculer le **Prix Médian Réel** et le **Prix Optimal de Revente Rapide** sous 48h !`
+          `3. Calculer la **Médiane Mathématique Réelle** et le **Prix Optimal de Revente Rapide** sous 48h !\n` +
+          `4. Te donner la liste transparente de tous les liens Vinted réels analysés.`
       )
       .setFooter({ text: 'DJEY Expert Resell IA • Glisse ta photo ici-même' });
 
@@ -97,7 +99,45 @@ export async function handleResellButtonClicks(interaction: ButtonInteraction): 
     return true;
   }
 
-  // 3. 📝 Fiche de Revente SEO Button
+  // 3. 📋 Voir la liste des comparables
+  if (customId.startsWith('btn_view_comparables_')) {
+    const searchId = customId.replace('btn_view_comparables_', '');
+    const data = comparablesCache.get(searchId);
+
+    if (!data || data.items.length === 0) {
+      await interaction.reply({
+        content: '⚠️ Aucune liste de comparables trouvée pour cette recherche (recherche expirée ou aucun article disponible).',
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    const listLines = data.items.slice(0, 20).map((it) => {
+      return `• **${it.price} €** — ${it.size} — @${it.seller} (${it.rating}★) ➔ [Lien direct](${it.url})`;
+    });
+
+    const embed = new EmbedBuilder()
+      .setTitle(`📋 Comparables Vinted Réels · ${data.brand} ${data.model}`)
+      .setColor(0x5865f2)
+      .setDescription(
+        `Voici les **${data.items.length} annonces réelles** utilisées pour le calcul de la médiane :\n\n` +
+          listLines.join('\n') +
+          (data.items.length > 20 ? `\n*... et ${data.items.length - 20} autres annonces.*` : '') +
+          `\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `📉 **Prix le plus bas constaté :** **${data.minPrice} €**\n` +
+          `📊 **Médiane retenue :** **~${data.medianPrice} €**\n` +
+          `📈 **Prix le plus haut constaté :** **${data.maxPrice} €**`
+      )
+      .setFooter({ text: 'DJEY Expert Resell IA • Liens directs officiels Vinted' });
+
+    await interaction.reply({
+      embeds: [embed],
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  // 4. 📝 Fiche de Revente SEO Button
   if (customId === 'btn_resell_seo') {
     const session = getUserSession(userId);
 
@@ -161,11 +201,12 @@ export async function handleResellButtonClicks(interaction: ButtonInteraction): 
     return true;
   }
 
-  // 4. ✨ Action Button from Identification: Generate Listing directly
+  // 5. ✨ Action Button from Identification: Generate Listing directly
   if (customId.startsWith('btn_generate_listing_')) {
     await interaction.deferReply({ ephemeral: true });
     const session = getUserSession(userId);
     const item = session.lastIdentifiedItem || {
+      searchId: '',
       brand: 'Vintage',
       model: 'Streetwear',
       medianPrice: 50,
@@ -195,7 +236,7 @@ export async function handleResellButtonClicks(interaction: ButtonInteraction): 
     return true;
   }
 
-  // 5. 📋 Copy Listing Button
+  // 6. 📋 Copy Listing Button
   if (customId === 'btn_copy_listing_text') {
     const session = getUserSession(userId);
     if (!session.lastGeneratedListing) {
@@ -286,6 +327,7 @@ export async function handleIncomingDmMessage(message: Message) {
 
     // Save identified item into session
     session.lastIdentifiedItem = {
+      searchId: result.searchId,
       brand: result.brand,
       model: result.model,
       era: result.era,
@@ -298,43 +340,60 @@ export async function handleIncomingDmMessage(message: Message) {
       .setTitle(`🏷️ IDENTIFICATION : ${result.brand} - ${result.model}`)
       .setColor(0x9b59b6)
       .setDescription(
-        `✨ **Analyse visuelle et estimation de marché réussies !**\n\n` +
+        `✨ **Reconnaissance visuelle et analyse du marché Vinted :**\n\n` +
           `• **Époque / Style** : ${result.era}\n` +
           `• **Matière / Couleur** : ${result.colorMaterial}\n` +
-          `• **Mots-clés Vinted** : \`${result.suggestedKeywords.join(', ')}\``
+          `• **Catégorie** : ${result.category}\n` +
+          (result.suggestedKeywords.length
+            ? `• **Mots-clés Vinted** : \`${result.suggestedKeywords.join(', ')}\`\n`
+            : '')
       )
       .addFields(
         {
-          name: '📊 PRIX MÉDIAN DU MARCHÉ',
-          value: `**~${result.medianPrice} €**\n*(calculé sur ${result.comparablesFound} annonces réelles)*`,
+          name: '📊 Médiane Marché',
+          value: result.comparablesFound > 0
+            ? `**~${result.medianPrice} €**\n*(calculé sur ${result.comparablesFound} annonces réelles)*`
+            : `*Données en attente*`,
           inline: true,
         },
         {
-          name: '📈 FOURCHETTE DU MARCHÉ',
-          value: `**${result.priceRange.min} € à ${result.priceRange.max} €**`,
+          name: '📈 Fourchette constatée',
+          value: result.comparablesFound > 0
+            ? `**${result.priceRange.min} € à ${result.priceRange.max} €**`
+            : `*Non disponible*`,
           inline: true,
         },
         {
-          name: '💡 PRIX DE VENTE CONSEILLÉ',
-          value: `**${result.recommendedSellPrice} €**\n*(revente rapide sous 48h)*`,
-          inline: true,
-        },
-        {
-          name: '⏳ Liquidité Estimée',
-          value: `**${result.liquidity}**`,
+          name: '💡 Prix de vente rapide conseillé',
+          value: result.comparablesFound > 0
+            ? `**${result.recommendedSellPrice} €**\n*(sous 48h)*`
+            : `*Non disponible*`,
           inline: true,
         }
       )
-      .setFooter({ text: 'DJEY Expert Resell IA • Données Vinted en temps réel' })
+      .setFooter({ text: 'DJEY Expert Resell IA • Données Vinted réelles' })
       .setTimestamp();
 
     if (attachments[0]?.url) {
       embed.setThumbnail(attachments[0].url);
     }
 
-    const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    const actionRow = new ActionRowBuilder<ButtonBuilder>();
+
+    // Mandatory Transparency Button: "📋 Voir la liste des comparables ([X] annonces)"
+    if (result.comparablesFound > 0) {
+      actionRow.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`btn_view_comparables_${result.searchId}`)
+          .setLabel(`📋 Voir la liste (${result.comparablesFound} annonces)`)
+          .setStyle(ButtonStyle.Primary)
+      );
+    }
+
+    // Direct Action Button: "✨ Générer l'annonce pour revendre"
+    actionRow.addComponents(
       new ButtonBuilder()
-        .setCustomId('btn_generate_listing_direct')
+        .setCustomId(`btn_generate_listing_${result.searchId}`)
         .setLabel('✨ Générer l\'annonce pour revendre')
         .setStyle(ButtonStyle.Success)
     );

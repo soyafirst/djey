@@ -13,7 +13,18 @@ const ai = new GoogleGenAI({
   },
 });
 
+export interface ComparableListing {
+  id: number;
+  title: string;
+  price: number;
+  size: string;
+  seller: string;
+  rating: string;
+  url: string;
+}
+
 export interface IdentificationResult {
+  searchId: string;
   brand: string;
   model: string;
   era: string; // e.g. "Vintage 90s", "Y2K", "Contemporain"
@@ -25,6 +36,8 @@ export interface IdentificationResult {
   priceRange: { min: number; max: number };
   recommendedSellPrice: number;
   liquidity: 'TRÈS FORTE (< 24h)' | 'FORTE (< 48h)' | 'MOYENNE (1-2 sem.)' | 'FAIBLE';
+  comparables: ComparableListing[];
+  apiSuccess: boolean;
 }
 
 export interface LegitCheckResult {
@@ -45,15 +58,60 @@ export interface SeoListingResult {
   hashtags: string[];
 }
 
+// In-memory cache of comparables for the "📋 Voir la liste des comparables" button
+export const comparablesCache = new Map<
+  string,
+  {
+    brand: string;
+    model: string;
+    medianPrice: number;
+    minPrice: number;
+    maxPrice: number;
+    items: ComparableListing[];
+  }
+>();
+
 export class ResellAiService {
+  private sessionCookie: string = '';
+  private lastCookieTime: number = 0;
+
   /**
-   * Identifies an item from an image (base64 or URL) and/or description,
-   * then computes real market comparable statistics.
+   * Handshake on Vinted to obtain genuine session cookie.
+   */
+  private async getSessionCookie(): Promise<string> {
+    if (this.sessionCookie && Date.now() - this.lastCookieTime < 25 * 60 * 1000) {
+      return this.sessionCookie;
+    }
+    try {
+      const resp = await axios.get('https://www.vinted.fr', {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Accept-Language': 'fr-FR,fr;q=0.9',
+        },
+        timeout: 5000,
+      });
+      const sc = resp.headers['set-cookie'];
+      if (sc && Array.isArray(sc)) {
+        this.sessionCookie = sc.map((c) => c.split(';')[0]).join('; ');
+        this.lastCookieTime = Date.now();
+      }
+    } catch (e: any) {
+      logger.log('scanner', `[Erreur poignée de main Vinted]: ${e.message}`);
+    }
+    return this.sessionCookie;
+  }
+
+  /**
+   * Identifies an item from an image (base64) and/or text description,
+   * then computes real market comparable statistics from strictly genuine Vinted API items.
    */
   public async identifyAndEstimate(
     image?: { data: string; mimeType: string },
     userTextPrompt?: string
   ): Promise<IdentificationResult> {
+    const searchId = `srch_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+
     try {
       const parts: any[] = [];
 
@@ -67,17 +125,16 @@ export class ResellAiService {
       }
 
       const promptText = `
-Tu es un expert mondial en achat-revente Vinted, friperie, streetwear et luxe d'occasion.
-Analyse précisément cet article vestimentaire / accessoire à partir de la photo et/ou du texte : "${userTextPrompt || ''}".
+Tu es un expert mondial en friperie, streetwear et luxe d'occasion sur Vinted.
+Analyse précisément cet article à partir de la photo et/ou de la description : "${userTextPrompt || ''}".
 
-Extrais les informations sous format JSON strict avec les champs suivants :
+Extrais en format JSON strict :
 - brand : La marque identifiée (ex: "Carhartt", "Ralph Lauren", "Nike", "Stüssy")
 - model : Le modèle exact (ex: "Detroit Jacket J97", "Doudoune sans manche Polo", "Dunk Low Retro")
 - era : L'époque ou style (ex: "Vintage 90s", "Années 2000 / Y2K", "Collection Récente")
 - colorMaterial : Couleur dominante et matière (ex: "Toile de coton marron délavé et col velours")
 - category : Catégorie Vinted (ex: "Vestes & manteaux", "Sneakers", "Sweats")
-- searchKeywords : 3 à 5 mots clés précis pour la recherche Vinted
-- baseEstimatedMedian : estimation préliminaire du prix médian en euros (nombre entier)
+- searchKeywords : 2 à 4 mots clés de recherche les plus efficaces sur Vinted (ex: ["carhartt", "detroit", "j97"])
 `;
 
       parts.push({ text: promptText });
@@ -101,7 +158,6 @@ Extrais les informations sous format JSON strict avec les champs suivants :
                 type: Type.ARRAY,
                 items: { type: Type.STRING },
               },
-              baseEstimatedMedian: { type: Type.NUMBER },
             },
             required: ['brand', 'model', 'era', 'colorMaterial', 'category', 'searchKeywords'],
           },
@@ -112,63 +168,91 @@ Extrais les informations sous format JSON strict avec les champs suivants :
       const brand = parsed.brand || 'Marque Reconnue';
       const model = parsed.model || 'Article Tendance';
       const era = parsed.era || 'Vintage';
-      const colorMaterial = parsed.colorMaterial || 'Tissu standard';
+      const colorMaterial = parsed.colorMaterial || 'Tissu';
       const category = parsed.category || 'Vêtements';
 
-      // Step 2: Query Vinted Market Statistics
-      logger.log('scanner', `Recherche Vinted des comparables réels pour "${brand} ${model}"...`);
+      // Step 2: Query REAL Vinted Market Statistics (Zero mock data!)
+      logger.log('scanner', `Recherche Vinted des annonces réelles pour "${brand} ${model}"...`);
       const searchTerms = `${brand} ${model}`;
-      const marketStats = await this.queryComparableVintedPrices(searchTerms, parsed.baseEstimatedMedian || 65);
+      const marketData = await this.queryComparableVintedPrices(searchTerms);
 
-      const recommendedSellPrice = Math.round(marketStats.medianPrice * 0.92); // Optimal for 48h fast sale
+      const comparables = marketData.comparables;
+      const comparablesFound = comparables.length;
+
+      let medianPrice = marketData.medianPrice;
+      let minPrice = marketData.priceRange.min;
+      let maxPrice = marketData.priceRange.max;
+      let recommendedSellPrice = Math.round(medianPrice * 0.92);
 
       let liquidity: IdentificationResult['liquidity'] = 'FORTE (< 48h)';
-      if (marketStats.comparablesFound >= 25) {
+      if (comparablesFound >= 25) {
         liquidity = 'TRÈS FORTE (< 24h)';
-      } else if (marketStats.comparablesFound < 8) {
+      } else if (comparablesFound < 8) {
         liquidity = 'MOYENNE (1-2 sem.)';
       }
 
+      // Store in memory cache for transparency button
+      comparablesCache.set(searchId, {
+        brand,
+        model,
+        medianPrice,
+        minPrice,
+        maxPrice,
+        items: comparables,
+      });
+
       return {
+        searchId,
         brand,
         model,
         era,
         colorMaterial,
         category,
         suggestedKeywords: parsed.searchKeywords || [brand, model],
-        comparablesFound: marketStats.comparablesFound,
-        medianPrice: marketStats.medianPrice,
-        priceRange: marketStats.priceRange,
+        comparablesFound,
+        medianPrice,
+        priceRange: { min: minPrice, max: maxPrice },
         recommendedSellPrice,
         liquidity,
+        comparables,
+        apiSuccess: marketData.apiSuccess,
       };
     } catch (err: any) {
       logger.log('error', `Erreur identification IA: ${err.message}`);
-      // High-quality fallback based on inputs
       return {
-        brand: 'Pièce Streetwear / Vintage',
-        model: userTextPrompt || 'Article Tendance',
-        era: 'Vintage 90s / Y2K',
-        colorMaterial: 'Coton de qualité',
-        category: 'Mode & Streetwear',
-        suggestedKeywords: ['vintage', 'streetwear', 'oversized'],
-        comparablesFound: 18,
-        medianPrice: 55,
-        priceRange: { min: 35, max: 85 },
-        recommendedSellPrice: 49,
-        liquidity: 'FORTE (< 48h)',
+        searchId,
+        brand: 'Article analysé',
+        model: userTextPrompt || 'Pièce de mode',
+        era: 'Vintage',
+        colorMaterial: 'Matière textile',
+        category: 'Mode',
+        suggestedKeywords: ['mode', 'streetwear'],
+        comparablesFound: 0,
+        medianPrice: 0,
+        priceRange: { min: 0, max: 0 },
+        recommendedSellPrice: 0,
+        liquidity: 'MOYENNE (1-2 sem.)',
+        comparables: [],
+        apiSuccess: false,
       };
     }
   }
 
   /**
-   * Real Market Vinted comparables lookup.
+   * Real Market Vinted comparables lookup from the official catalog API.
+   * STRICT: If API fails, returns [] and DOES NOT invent fake prices.
    */
-  private async queryComparableVintedPrices(
-    query: string,
-    fallbackBenchmark: number
-  ): Promise<{ comparablesFound: number; medianPrice: number; priceRange: { min: number; max: number } }> {
+  public async queryComparableVintedPrices(
+    query: string
+  ): Promise<{
+    comparables: ComparableListing[];
+    medianPrice: number;
+    priceRange: { min: number; max: number };
+    apiSuccess: boolean;
+  }> {
     try {
+      const cookie = await this.getSessionCookie();
+
       const resp = await axios.get('https://www.vinted.fr/api/v2/catalog/items', {
         params: {
           search_text: query,
@@ -177,47 +261,87 @@ Extrais les informations sous format JSON strict avec les champs suivants :
         },
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Cookie: cookie,
           Accept: 'application/json, text/plain, */*',
           'Accept-Language': 'fr-FR,fr;q=0.9',
+          Referer: 'https://www.vinted.fr/catalog',
         },
-        timeout: 4000,
+        timeout: 5000,
       });
 
-      if (resp.data && Array.isArray(resp.data.items) && resp.data.items.length >= 3) {
-        const prices = resp.data.items
-          .map((it: any) => (typeof it.price === 'string' ? parseFloat(it.price.replace(',', '.')) : Number(it.price)))
-          .filter((p: number) => !isNaN(p) && p > 5 && p < 2000);
+      if (resp.data && Array.isArray(resp.data.items) && resp.data.items.length > 0) {
+        const rawItems = resp.data.items;
+        const validListings: ComparableListing[] = [];
 
-        if (prices.length >= 3) {
-          const report = marketAnalyzer.analyzePrices(0, prices);
+        for (const it of rawItems) {
+          const numId = Number(it.id);
+          if (!numId || isNaN(numId) || numId <= 0) continue;
+
+          const price =
+            typeof it.price === 'string'
+              ? parseFloat(it.price.replace(',', '.'))
+              : Number(it.price);
+
+          if (isNaN(price) || price <= 0 || price > 5000) continue;
+
+          const size = it.size_title || it.size || 'Unique';
+          const seller = it.user?.login || it.user?.username || 'Vendeur';
+          const rating = it.user?.feedback_reputation
+            ? (it.user.feedback_reputation * 5).toFixed(1)
+            : (it.user?.feedback_count ? '5.0' : '5.0');
+
+          // STRICT CANONICAL URL FORMAT
+          const canonicalUrl = `https://www.vinted.fr/items/${numId}`;
+
+          validListings.push({
+            id: numId,
+            title: it.title || 'Article',
+            price,
+            size,
+            seller,
+            rating,
+            url: canonicalUrl,
+          });
+        }
+
+        if (validListings.length > 0) {
+          // Calculate true mathematical median
+          const sortedPrices = validListings.map((l) => l.price).sort((a, b) => a - b);
+          const mid = Math.floor(sortedPrices.length / 2);
+          const median =
+            sortedPrices.length % 2 !== 0
+              ? sortedPrices[mid]
+              : (sortedPrices[mid - 1] + sortedPrices[mid]) / 2;
+
+          const min = sortedPrices[0];
+          const max = sortedPrices[sortedPrices.length - 1];
+
           return {
-            comparablesFound: prices.length,
-            medianPrice: Math.round(report.medianPrice),
-            priceRange: { min: report.minPrice, max: report.maxPrice },
+            comparables: validListings,
+            medianPrice: Math.round(median * 10) / 10,
+            priceRange: { min, max },
+            apiSuccess: true,
           };
         }
       }
-    } catch (e) {
-      // In case of Vinted rate limit or cloud IP block, calculate on simulated comparable distribution
-    }
 
-    // Realistic distributed benchmark
-    const base = fallbackBenchmark > 0 ? fallbackBenchmark : 55;
-    const simPrices = [
-      Math.round(base * 0.7),
-      Math.round(base * 0.85),
-      Math.round(base * 0.95),
-      Math.round(base),
-      Math.round(base * 1.05),
-      Math.round(base * 1.2),
-      Math.round(base * 1.4),
-    ];
-    const report = marketAnalyzer.analyzePrices(0, simPrices);
-    return {
-      comparablesFound: 24,
-      medianPrice: Math.round(report.medianPrice),
-      priceRange: { min: report.minPrice, max: report.maxPrice },
-    };
+      return {
+        comparables: [],
+        medianPrice: 0,
+        priceRange: { min: 0, max: 0 },
+        apiSuccess: true,
+      };
+    } catch (e: any) {
+      this.sessionCookie = '';
+      logger.log('scanner', `[Erreur API Vinted - Pause temporaire] (${e.response?.status || e.message})`);
+      // RULE: Do not invent fake replacement items
+      return {
+        comparables: [],
+        medianPrice: 0,
+        priceRange: { min: 0, max: 0 },
+        apiSuccess: false,
+      };
+    }
   }
 
   /**
@@ -256,8 +380,8 @@ Retourne un objet JSON strict :
 - score : Note de confiance d'authenticité de 0 à 100 (ex: 92 pour authentique, 30 pour faux avéré)
 - verdict : "Pièce Authentique", "Très Forte Probabilité d'Authenticité", "Doute Majeur / Contrefaçon Suspectée", "Réplique Détectée"
 - verdictEmoji : "🟢" si score >= 80, "🟡" si score entre 55 et 79, "🔴" si score < 55
-- conformPoints : Liste de 3 à 5 points conformes précis (ex: "Police de l'étiquette conforme aux modèles des années 90", "Coutures régulières sans fil tiré")
-- suspectPoints : Liste de 1 à 3 points à surveiller ou suspects (ex: "Légère asymétrie sur la broderie secondaire")
+- conformPoints : Liste de 3 à 5 points conformes précis
+- suspectPoints : Liste de 1 à 3 points à surveiller ou suspects
 - advice : Conseil avisé pour l'acheteur avant de finaliser la transaction.
 `;
 

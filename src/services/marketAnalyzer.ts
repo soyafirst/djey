@@ -26,24 +26,7 @@ export class MarketAnalyzer {
       .filter((p) => !isNaN(p) && p > 1 && p < 10000)
       .sort((a, b) => a - b);
 
-    // If insufficient data, build realistic estimates around purchase price
-    let samplePrices = validPrices;
-    if (samplePrices.length < 3) {
-      const benchmark = purchasePrice > 0 ? purchasePrice * 1.65 : 50;
-      samplePrices = [
-        Math.round(benchmark * 0.85),
-        Math.round(benchmark * 0.95),
-        Math.round(benchmark),
-        Math.round(benchmark * 1.1),
-        Math.round(benchmark * 1.25),
-      ];
-    }
-
-    // Filter extreme outliers using 10th and 90th percentiles
-    const p10Index = Math.floor(samplePrices.length * 0.1);
-    const p90Index = Math.ceil(samplePrices.length * 0.9);
-    const filteredPrices = samplePrices.slice(p10Index, p90Index);
-    const activeSample = filteredPrices.length >= 3 ? filteredPrices : samplePrices;
+    const activeSample = validPrices.length > 0 ? validPrices : [Math.max(1, purchasePrice)];
 
     // Median
     const mid = Math.floor(activeSample.length / 2);

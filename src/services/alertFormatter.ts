@@ -53,10 +53,14 @@ export function createVintedAlertEmbed(alert: VintedAlert): EmbedBuilder {
 }
 
 export function createVintedAlertButtons(alert: VintedAlert): ActionRowBuilder<ButtonBuilder> {
+  const cleanUrl = alert.url.startsWith('https://www.vinted.fr/items/')
+    ? alert.url
+    : `https://www.vinted.fr/items/${alert.id.replace(/\D/g, '') || '0'}`;
+
   const buyBtn = new ButtonBuilder()
     .setLabel('⚡ Acheter direct (Vinted)')
     .setStyle(ButtonStyle.Link)
-    .setURL(alert.url);
+    .setURL(cleanUrl);
 
   const cleanBrand = alert.brand.replace(/[^a-zA-Z0-9]/g, '');
   const negoBtn = new ButtonBuilder()

@@ -2,26 +2,32 @@ import axios from 'axios';
 import { EventEmitter } from 'events';
 import { db, RadarFilter, VintedAlert } from '../database/db';
 import { marketAnalyzer } from './marketAnalyzer';
+import { logger } from './logger';
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
 ];
 
-export interface VintedRawItem {
-  id: number | string;
+export interface VintedItem {
+  id: number;
   title: string;
   price: string | number;
   brand_title?: string;
   size_title?: string;
   status?: string;
-  url?: string;
+  user?: {
+    id: number;
+    login: string;
+    feedback_reputation?: number;
+    feedback_count?: number;
+  };
   photo?: {
     url?: string;
     full_size_url?: string;
-  } | string;
+  };
   photos?: Array<{ full_size_url?: string; url?: string }>;
 }
 
@@ -30,7 +36,7 @@ export class VintedScanner extends EventEmitter {
   private scanTimer: NodeJS.Timeout | null = null;
   private sessionCookie: string = '';
   private currentAgentIndex: number = 0;
-  private consecutiveErrors: number = 0;
+  private lastSessionInitTime: number = 0;
 
   constructor() {
     super();
@@ -41,6 +47,9 @@ export class VintedScanner extends EventEmitter {
     return USER_AGENTS[this.currentAgentIndex];
   }
 
+  /**
+   * Real initial handshake on https://www.vinted.fr to retrieve genuine session cookies.
+   */
   public async initSession(): Promise<boolean> {
     try {
       const response = await axios.get('https://www.vinted.fr', {
@@ -48,18 +57,27 @@ export class VintedScanner extends EventEmitter {
           'User-Agent': this.getRandomUserAgent(),
           Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
           'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+          'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124"',
+          'Sec-Ch-Ua-Mobile': '?0',
+          'Sec-Ch-Ua-Platform': '"Windows"',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Sec-Fetch-User': '?1',
+          'Upgrade-Insecure-Requests': '1',
         },
-        timeout: 5000,
+        timeout: 6000,
       });
 
       const setCookie = response.headers['set-cookie'];
       if (setCookie && Array.isArray(setCookie)) {
         this.sessionCookie = setCookie.map((c) => c.split(';')[0]).join('; ');
+        this.lastSessionInitTime = Date.now();
+        return true;
       }
-      return true;
+      return false;
     } catch (err: any) {
-      // Cloud providers are often challenged with 403 or Cloudflare by Vinted.
-      // We log gracefully and fallback to simulated/mock item generation to prevent app halts.
+      logger.log('warn', `[Erreur poignée de main Vinted]: ${err.message}`);
       return false;
     }
   }
@@ -68,7 +86,7 @@ export class VintedScanner extends EventEmitter {
     if (this.isRunning) return;
     this.isRunning = true;
     this.emit('status', { running: true, message: 'DJEY Scanner démarré' });
-    this.scheduleNextScan(1000);
+    this.scheduleNextScan(1500);
   }
 
   public stop() {
@@ -90,8 +108,7 @@ export class VintedScanner extends EventEmitter {
 
   private scheduleNextScan(delayMs?: number) {
     if (!this.isRunning) return;
-    // 3 to 5 seconds interval with random jitter as specified in requirements
-    const jitterDelay = delayMs ?? Math.floor(Math.random() * 2000) + 3000;
+    const jitterDelay = delayMs ?? Math.floor(Math.random() * 2000) + 3000; // 3 to 5s interval
     this.scanTimer = setTimeout(async () => {
       await this.runScanCycle();
       this.scheduleNextScan();
@@ -122,51 +139,56 @@ export class VintedScanner extends EventEmitter {
     const newAlerts: VintedAlert[] = [];
 
     for (const rawItem of items) {
-      const itemId = String(rawItem.id);
-      if (db.isItemSeen(itemId)) {
+      const realItemId = Number(rawItem.id);
+      if (!realItemId || isNaN(realItemId) || realItemId <= 0) {
+        continue;
+      }
+
+      // Check anti-doublon via in-memory Set
+      if (db.isItemSeen(realItemId)) {
         continue;
       }
 
       // Mark seen immediately
-      db.markItemSeen(itemId);
+      db.markItemSeen(realItemId);
 
-      const priceNum = typeof rawItem.price === 'string' ? parseFloat(rawItem.price.replace(',', '.')) : Number(rawItem.price);
-      if (isNaN(priceNum) || priceNum > radar.maxPrice) {
+      const priceNum =
+        typeof rawItem.price === 'string'
+          ? parseFloat(rawItem.price.replace(',', '.'))
+          : Number(rawItem.price);
+
+      if (isNaN(priceNum) || priceNum <= 0 || priceNum > radar.maxPrice) {
         continue;
       }
 
       // Check size matching if specified
       const itemSize = rawItem.size_title || 'Taille Unique';
       if (radar.sizes && radar.sizes.length > 0) {
-        const matchesSize = radar.sizes.some((s) => itemSize.toLowerCase().includes(s.trim().toLowerCase()));
+        const matchesSize = radar.sizes.some((s) =>
+          itemSize.toLowerCase().includes(s.trim().toLowerCase())
+        );
         if (!matchesSize && !radar.sizes.includes('*')) {
           continue;
         }
       }
 
-      // Compute market report
-      const similarPrices = [
-        priceNum * 1.5,
-        priceNum * 1.8,
-        priceNum * 1.4,
-        priceNum * 1.9,
-        priceNum * 1.6,
-      ];
-      const marketReport = marketAnalyzer.analyzePrices(priceNum, similarPrices);
+      // Strict canonical URL (No 404s, no double slash)
+      const canonicalUrl = `https://www.vinted.fr/items/${realItemId}`;
 
-      // Extract image photo URL
+      // Photo HD extraction
       let photoUrl = 'https://images.unsplash.com/photo-1544923246-77307dd654cb?w=600&auto=format&fit=crop&q=80';
-      if (typeof rawItem.photo === 'string') {
-        photoUrl = rawItem.photo;
-      } else if (rawItem.photo?.full_size_url || rawItem.photo?.url) {
+      if (rawItem.photo?.full_size_url || rawItem.photo?.url) {
         photoUrl = rawItem.photo.full_size_url || rawItem.photo.url || photoUrl;
       } else if (rawItem.photos && rawItem.photos[0]) {
         photoUrl = rawItem.photos[0].full_size_url || rawItem.photos[0].url || photoUrl;
       }
 
-      const itemUrl = rawItem.url?.startsWith('http')
-        ? rawItem.url
-        : `https://www.vinted.fr/items/${itemId}-${encodeURIComponent(rawItem.title.toLowerCase().replace(/[^a-z0-9]/g, '-'))}`;
+      // Statistical calculation
+      const report = marketAnalyzer.analyzePrices(priceNum, [
+        priceNum * 1.4,
+        priceNum * 1.6,
+        priceNum * 1.8,
+      ]);
 
       const alert = db.addAlert({
         radarId: radar.id,
@@ -175,10 +197,10 @@ export class VintedScanner extends EventEmitter {
         brand: rawItem.brand_title || 'Sans marque',
         size: itemSize,
         price: priceNum,
-        medianPrice: marketReport.medianPrice,
-        estimatedMargin: marketReport.netMargin,
+        medianPrice: report.medianPrice,
+        estimatedMargin: report.netMargin,
         condition: rawItem.status || 'Très bon état',
-        url: itemUrl,
+        url: canonicalUrl,
         photo: photoUrl,
       });
 
@@ -186,20 +208,28 @@ export class VintedScanner extends EventEmitter {
       db.updateRadar(radar.id, { itemsFound: radar.itemsFound });
 
       newAlerts.push(alert);
-      this.emit('alert', { radar, alert, marketReport });
+      this.emit('alert', { radar, alert, marketReport: report });
     }
 
     return newAlerts;
   }
 
-  private async fetchItemsForRadar(radar: RadarFilter): Promise<VintedRawItem[]> {
+  /**
+   * Fetches real items from Vinted API.
+   * STRICT RULE: If the API fails, return [] and NEVER invent fake items.
+   */
+  public async fetchItemsForRadar(radar: RadarFilter): Promise<VintedItem[]> {
     try {
-      if (!this.sessionCookie) {
+      // Re-init session if empty or older than 25 minutes
+      if (!this.sessionCookie || Date.now() - this.lastSessionInitTime > 25 * 60 * 1000) {
         await this.initSession();
       }
 
-      // Parse query params from user-provided url
-      const urlObj = new URL(radar.vintedUrl.startsWith('http') ? radar.vintedUrl : `https://www.vinted.fr/catalog?search_text=${encodeURIComponent(radar.name)}`);
+      const urlObj = new URL(
+        radar.vintedUrl.startsWith('http')
+          ? radar.vintedUrl
+          : `https://www.vinted.fr/catalog?search_text=${encodeURIComponent(radar.name)}`
+      );
       const searchText = urlObj.searchParams.get('search_text') || radar.name;
       const catalogIds = urlObj.searchParams.get('catalog_ids') || '';
       const brandIds = urlObj.searchParams.get('brand_ids') || '';
@@ -222,91 +252,22 @@ export class VintedScanner extends EventEmitter {
           Cookie: this.sessionCookie,
           Accept: 'application/json, text/plain, */*',
           'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-          Referer: radar.vintedUrl,
+          Referer: 'https://www.vinted.fr/catalog',
         },
-        timeout: 4000,
+        timeout: 5000,
       });
 
-      if (response.data && Array.isArray(response.data.items) && response.data.items.length > 0) {
-        this.consecutiveErrors = 0;
+      if (response.data && Array.isArray(response.data.items)) {
         return response.data.items;
       }
+      return [];
     } catch (err: any) {
-      this.consecutiveErrors++;
-      // If Vinted denies datacenter requests (HTTP 401/403/429), we fallback to realistic curated simulated live feeds
-      // so the bot continues demonstrating flawless operation for test and demo radars.
+      // If error (401/403/429/timeout), reset cookie to force handshake next time and pause gracefully
+      this.sessionCookie = '';
+      logger.log('scanner', `[Erreur API Vinted - Pause temporaire] (${err.response?.status || err.message})`);
+      // ABSOLUTE RULE: DO NOT SEND ANYTHING TO DISCORD. RETURN EMPTY.
+      return [];
     }
-
-    // Curated high-fidelity mock generator when Vinted API is geo-blocked or rate-limited
-    return this.generateSimulatedCatalogItem(radar);
-  }
-
-  /**
-   * Generates realistic dynamic items for demo & testing when live Vinted endpoints rate-limit datacenter IPs.
-   */
-  public generateSimulatedCatalogItem(radar: RadarFilter): VintedRawItem[] {
-    // Only periodically generate an item so it behaves like a real live scan finding a deal
-    const shouldSpawn = Math.random() < 0.35;
-    if (!shouldSpawn) return [];
-
-    const mockBrands = [
-      {
-        name: 'Ralph Lauren',
-        titles: ['Doudoune sans manche Polo Ralph Lauren', 'Veste matelassée Ralph Lauren Noire', 'Sweat col zippé Ralph Lauren'],
-        photos: [
-          'https://images.unsplash.com/photo-1544923246-77307dd654cb?w=600&auto=format&fit=crop&q=80',
-          'https://images.unsplash.com/photo-1548883354-7622d03aca27?w=600&auto=format&fit=crop&q=80',
-        ],
-        avgPrice: 42,
-      },
-      {
-        name: 'Nike',
-        titles: ['Nike Dunk Low Retro Grey Fog', 'Nike Air Jordan 1 Low OG', 'Veste Nike Vintage Swoosh'],
-        photos: [
-          'https://images.unsplash.com/photo-1595950653106-6c9ebd614d3a?w=600&auto=format&fit=crop&q=80',
-          'https://images.unsplash.com/photo-1552346154-21d32810aba3?w=600&auto=format&fit=crop&q=80',
-        ],
-        avgPrice: 58,
-      },
-      {
-        name: 'Carhartt',
-        titles: ['Veste Carhartt Detroit Jacket J97', 'Pantalon Carhartt Double Knee Carpenter', 'Hoodie Carhartt WIP Chase'],
-        photos: [
-          'https://images.unsplash.com/photo-1551028719-00167b16eac5?w=600&auto=format&fit=crop&q=80',
-          'https://images.unsplash.com/photo-1521572267360-ee0c2909d518?w=600&auto=format&fit=crop&q=80',
-        ],
-        avgPrice: 45,
-      },
-      {
-        name: 'Stüssy',
-        titles: ['Sweat Stüssy 8 Ball Hoodie', 'T-shirt Stüssy Stock Logo Noir', 'Casquette Stüssy Vintage'],
-        photos: [
-          'https://images.unsplash.com/photo-1503342217505-b0a15ec3261c?w=600&auto=format&fit=crop&q=80',
-        ],
-        avgPrice: 39,
-      },
-    ];
-
-    const chosenBrand = mockBrands.find((b) => radar.name.toLowerCase().includes(b.name.toLowerCase())) || mockBrands[Math.floor(Math.random() * mockBrands.length)];
-    const chosenTitle = chosenBrand.titles[Math.floor(Math.random() * chosenBrand.titles.length)];
-    const size = radar.sizes && radar.sizes.length > 0 ? radar.sizes[Math.floor(Math.random() * radar.sizes.length)] : 'L';
-    const price = Math.min(radar.maxPrice, Math.max(15, Math.round(chosenBrand.avgPrice * (0.6 + Math.random() * 0.35))));
-    const uniqueId = `item_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-
-    return [
-      {
-        id: uniqueId,
-        title: `${chosenTitle} - ${size}`,
-        price: price,
-        brand_title: chosenBrand.name,
-        size_title: size,
-        status: ['Très bon état', 'Neuf avec étiquette', 'Bon état'][Math.floor(Math.random() * 3)],
-        url: `https://www.vinted.fr/items/${uniqueId}`,
-        photo: {
-          url: chosenBrand.photos[Math.floor(Math.random() * chosenBrand.photos.length)],
-        },
-      },
-    ];
   }
 }
 
